@@ -1,5 +1,5 @@
 pub mod lexer;
 
 fn main() {
-    println!("Hello, world!");
+    println!("Tikka time! There will be a LISP here soon");
 }

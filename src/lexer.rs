@@ -1,4 +1,4 @@
-use itertools::Itertools;
+use std::iter::Peekable;
 
 #[derive(Debug, Clone)]
 pub enum Token {
@@ -25,418 +25,171 @@ impl SpannedToken {
     ) -> Self {
         Self { tok, start, end }
     }
+
+    pub fn match_punct(
+        c: char,
+        pos: (usize, usize),
+    ) -> Option<Self> {
+        match c {
+            '(' => {
+                Some(SpannedToken::new(Token::LParen, pos, pos))
+            }
+            ')' => {
+                Some(SpannedToken::new(Token::RParen, pos, pos))
+            }
+            '\'' => {
+                Some(SpannedToken::new(Token::Quote, pos, pos))
+            }
+            _ => None,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-enum LexState {
-    Normal,
-    InString(bool), // bool indicates if prev char was escape
-    InSymbol,
-    InNumber,
+fn lex_punct(
+    stream: &mut Peekable<
+        impl Iterator<Item = (usize, usize, char)>,
+    >,
+) -> Option<SpannedToken> {
+    let tok = stream.peek().and_then(|(line, col, c)| {
+        SpannedToken::match_punct(*c, (*line, *col))
+    });
+
+    stream.next_if(|_| tok.is_some());
+    tok
 }
 
-#[derive(Debug, Clone)]
-enum LexItem {
-    Token(SpannedToken),
-    Char(char, (usize, usize)),
-    StringStart((usize, usize)),
-    StringEnd,
+fn lex_number(
+    stream: &mut Peekable<
+        impl Iterator<Item = (usize, usize, char)>,
+    >,
+) -> Option<SpannedToken> {
+    let mut number = String::new();
+    let start = *stream.peek()?;
+
+    while let Some(&(_, _, c)) = stream.peek() {
+        if c.is_ascii_digit() || c == '.' {
+            number.push(c);
+            stream.next();
+        } else {
+            break;
+        }
+    }
+
+    if number.is_empty() {
+        None
+    } else {
+        let end = stream.peek().unwrap_or(&start);
+        Some(SpannedToken::new(
+            Token::Number(number),
+            (start.0, start.1),
+            // FIXME: Gotta rollback properly
+            (end.0, end.1 - 1),
+        ))
+    }
+}
+
+fn lex_symbol(
+    stream: &mut Peekable<
+        impl Iterator<Item = (usize, usize, char)>,
+    >,
+) -> Option<SpannedToken> {
+    let mut symbol = String::new();
+    let start = *stream.peek()?;
+
+    while let Some(&(_, _, c)) = stream.peek() {
+        if c.is_alphanumeric()
+            || "!$%&*+-./:<=>?@^_~".contains(c)
+        {
+            symbol.push(c);
+            stream.next();
+        } else {
+            break;
+        }
+    }
+
+    if symbol.is_empty() {
+        None
+    } else {
+        let end = stream.peek().unwrap_or(&start);
+        Some(SpannedToken::new(
+            Token::Symbol(symbol),
+            (start.0, start.1),
+            // FIXME: Gotta rollback properly
+            (end.0, end.1 - 1),
+        ))
+    }
+}
+
+fn lex_string(
+    stream: &mut Peekable<
+        impl Iterator<Item = (usize, usize, char)>,
+    >,
+) -> Option<SpannedToken> {
+    if stream.peek().map_or(false, |&(_, _, c)| c == '"') {
+        let start = *stream.peek()?;
+        stream.next(); // Consume opening quote
+        let mut string = String::new();
+
+        while let Some(&(_, _, c)) = stream.peek() {
+            match c {
+                '"' => {
+                    let end =
+                        stream.next().expect("BUG: Impossible"); // Consume closing quote
+                    return Some(SpannedToken::new(
+                        Token::String(string),
+                        (start.0, start.1),
+                        (end.0, end.1),
+                    ));
+                }
+                '\\' => {
+                    string.push(c);
+                    stream.next();
+                    if let Some(&(_, _, next)) = stream.peek() {
+                        string.push(next);
+                        stream.next();
+                    }
+                }
+                _ => {
+                    string.push(c);
+                    stream.next();
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn lex(
     input: impl Iterator<Item = char>,
 ) -> impl Iterator<Item = SpannedToken> {
-    let mut position = (0, 0);
+    let mut numbered = input
+        .scan((0, 0), |(line, col), c| {
+            let current = (*line, *col);
+            if c == '\n' {
+                *line += 1;
+                *col = 0;
+            } else {
+                *col += 1;
+            }
 
-    let mut buffer = vec![];
-    let mut state = LexState::Normal;
+            Some((current.0, current.1, c))
+        })
+        .inspect(|x| println!("{:?}", x))
+        .peekable();
+
     let mut tokens = vec![];
 
-    let mut mark = position;
+    #[allow(clippy::option_map_unit_fn)]
+    while numbered.peek().is_some() {
+        lex_punct(&mut numbered).map(|t| tokens.push(t));
+        lex_number(&mut numbered).map(|t| tokens.push(t));
+        lex_symbol(&mut numbered).map(|t| tokens.push(t));
+        lex_string(&mut numbered).map(|t| tokens.push(t));
 
-    for c in input {
-        use LexState::*;
-        eprintln!("{}{:?}", c, state);
-        match state {
-            Normal => match c {
-                '(' => tokens.push(SpannedToken::new(
-                    Token::LParen,
-                    position,
-                    position,
-                )),
-                ')' => tokens.push(SpannedToken::new(
-                    Token::RParen,
-                    position,
-                    position,
-                )),
-                '\'' => tokens.push(SpannedToken::new(
-                    Token::Quote,
-                    position,
-                    position,
-                )),
-                '"' => state = InString(false),
-                c if c.is_whitespace() => (),
-                c if c.is_digit(10) => {
-                    state = InNumber;
-
-                    mark = position;
-                    buffer.clear();
-                    buffer.push(c);
-                }
-                c => {
-                    mark = position;
-                    state = InSymbol;
-
-                    buffer.clear();
-                    buffer.push(c);
-                }
-            },
-            InSymbol => match c {
-                c if c.is_whitespace() => {
-                    tokens.push(SpannedToken::new(
-                        Token::Symbol(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    state = Normal;
-                }
-                '(' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Symbol(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    tokens.push(SpannedToken::new(
-                        Token::LParen,
-                        position,
-                        position,
-                    ));
-
-                    state = Normal;
-                }
-                ')' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Symbol(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    tokens.push(SpannedToken::new(
-                        Token::RParen,
-                        position,
-                        position,
-                    ));
-
-                    state = Normal;
-                }
-                '\'' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Symbol(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    tokens.push(SpannedToken::new(
-                        Token::Quote,
-                        position,
-                        position,
-                    ));
-
-                    state = Normal;
-                }
-                '"' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Symbol(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    mark = position;
-                    buffer.clear();
-                    state = InString(false);
-                }
-                c => buffer.push(c),
-            },
-            InNumber => match c {
-                c if c.is_numeric() => {
-                    buffer.push(c);
-                }
-                '(' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Number(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    tokens.push(SpannedToken::new(
-                        Token::LParen,
-                        position,
-                        position,
-                    ));
-
-                    state = Normal;
-                }
-                ')' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Number(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    tokens.push(SpannedToken::new(
-                        Token::RParen,
-                        position,
-                        position,
-                    ));
-
-                    state = Normal;
-                }
-                '\'' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Number(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    tokens.push(SpannedToken::new(
-                        Token::Quote,
-                        position,
-                        position,
-                    ));
-
-                    state = Normal;
-                }
-                '"' => {
-                    tokens.push(SpannedToken::new(
-                        Token::Number(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        position,
-                    ));
-
-                    mark = position;
-                    buffer.clear();
-                    state = InString(false);
-                }
-                c => {
-                    tokens.push(SpannedToken::new(
-                        Token::Number(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        // FIXME: this will be bad if we are at the beginning of the line
-                        (position.0, position.1 - 1),
-                    ));
-
-                    mark = position;
-                    buffer.clear();
-
-                    // whitespace bullshit
-                    // need to move mark correctly
-                    if !c.is_whitespace() {
-                        buffer.push(c);
-                    }
-
-                    if c.is_whitespace() {
-                        state = Normal;
-                    } else if c.is_numeric() {
-                        state = InNumber;
-                    } else {
-                        state = InSymbol;
-                    }
-                }
-            },
-            InString(escaped) => match c {
-                '\\' => {
-                    state = InString(true);
-                }
-                '"' if !escaped => {
-                    tokens.push(SpannedToken::new(
-                        Token::String(
-                            buffer.clone().iter().collect(),
-                        ),
-                        mark,
-                        position,
-                    ));
-                    state = Normal;
-                }
-                c => {
-                    buffer.push(c);
-                    state = InString(false);
-                }
-            },
-        }
-
-        if c == '\n' {
-            position.0 += 1;
-            position.1 = 0;
-        } else {
-            position.1 += 1;
-        }
+        numbered.next_if(|(_, _, c)| c.is_whitespace());
     }
 
     tokens.into_iter()
-}
-
-pub fn iter_lex(
-    input: impl Iterator<Item = char>,
-) -> impl Iterator<Item = SpannedToken> {
-    input
-        .scan(
-            ((1, 0), LexState::Normal),
-            |((line, col), state), c| {
-                let current_pos = (*line, *col);
-
-                if c == '\n' {
-                    *line += 1;
-                    *col = 0;
-                } else {
-                    *col += 1;
-                }
-
-                let res = match state {
-                    LexState::Normal => match c {
-                        '(' => Some(LexItem::Token(
-                            SpannedToken::new(
-                                Token::LParen,
-                                current_pos,
-                                current_pos,
-                            ),
-                        )),
-                        ')' => {
-                            Some(LexItem::Token(SpannedToken {
-                                tok: Token::RParen,
-                                start: current_pos,
-                                end: current_pos,
-                            }))
-                        }
-                        '\'' => {
-                            Some(LexItem::Token(SpannedToken {
-                                tok: Token::Quote,
-                                start: current_pos,
-                                end: current_pos,
-                            }))
-                        }
-                        '"' => {
-                            *state = LexState::InString(false);
-                            Some(LexItem::StringStart(
-                                current_pos,
-                            ))
-                        }
-                        c if c.is_digit(10) => {
-                            *state = LexState::InNumber;
-                            Some(LexItem::Char(c, current_pos))
-                        }
-                        c if !c.is_whitespace() => {
-                            *state = LexState::InSymbol;
-                            Some(LexItem::Char(c, current_pos))
-                        }
-                        _ => None,
-                    },
-                    LexState::InString(false) if c == '"' => {
-                        *state = LexState::Normal;
-                        Some(LexItem::StringEnd)
-                    }
-                    LexState::InString(is_escaped) => {
-                        *state = LexState::InString(
-                            c == '\\' && !*is_escaped,
-                        );
-                        Some(LexItem::Char(c, current_pos))
-                    }
-                    LexState::InSymbol | LexState::InNumber
-                        if c.is_whitespace()
-                            || c == '('
-                            || c == ')'
-                            || c == '\'' =>
-                    {
-                        *state = LexState::Normal;
-                        *col -= 1; // Rewind for the delimiter
-                        None
-                    }
-                    LexState::InSymbol | LexState::InNumber => {
-                        Some(LexItem::Char(c, current_pos))
-                    }
-                };
-
-                Some(res)
-            },
-        )
-        .filter_map(|x| x)
-        .peekable()
-        .batching(|it| match it.next() {
-            Some(LexItem::Token(token)) => Some(token),
-            Some(LexItem::StringStart(start)) => {
-                let mut content = String::new();
-                let mut end = start;
-
-                while let Some(LexItem::Char(c, pos)) = it.next()
-                {
-                    content.push(c);
-                    end = pos;
-                }
-
-                if let Some(LexItem::StringEnd) = it.next() {
-                    Some(SpannedToken {
-                        tok: Token::String(content),
-                        start,
-                        end,
-                    })
-                } else {
-                    panic!("Unterminated string")
-                }
-            }
-            // All string_ends should be consumed by the match arm above
-            Some(LexItem::StringEnd) => {
-                unreachable!("You broke it, didn't you?")
-            }
-            Some(LexItem::Char(first_char, start)) => {
-                let mut content = first_char.to_string();
-                let mut end = start;
-
-                while let Some(&LexItem::Char(c, pos)) =
-                    it.peek()
-                {
-                    content.push(c);
-                    end = pos;
-                    it.next();
-                }
-
-                let tok = if first_char.is_digit(10) {
-                    Token::Number(content)
-                } else {
-                    Token::Symbol(content)
-                };
-                Some(SpannedToken { tok, start, end })
-            }
-            None => None,
-        })
 }
 
 #[cfg(test)]
@@ -447,8 +200,8 @@ mod tests {
         actual: Vec<SpannedToken>,
         expected: Vec<SpannedToken>,
     ) {
-        dbg!(&actual);
-        dbg!(&expected);
+        println!("{:?}", &actual);
+        println!("{:?}", &expected);
         assert_eq!(actual.len(), expected.len());
         for (a, e) in
             actual.into_iter().zip(expected.into_iter())
@@ -495,11 +248,7 @@ mod tests {
             ),
             SpannedToken::new(Token::RParen, (0, 6), (0, 6)),
         ];
-        // compare_tokens(
-        //     lex(input.clone()).collect(),
-        //     expected.clone(),
-        // );
-        compare_tokens(iter_lex(input).collect(), expected);
+        compare_tokens(lex(input).collect(), expected);
     }
 
     #[test]
@@ -516,15 +265,11 @@ mod tests {
             SpannedToken::new(
                 Token::String("world\\n".to_string()),
                 (0, 8),
-                (0, 15),
+                (0, 16),
             ),
-            SpannedToken::new(Token::RParen, (0, 16), (0, 16)),
+            SpannedToken::new(Token::RParen, (0, 17), (0, 17)),
         ];
-        compare_tokens(
-            lex(input.clone()).collect(),
-            expected.clone(),
-        );
-        compare_tokens(iter_lex(input).collect(), expected);
+        compare_tokens(lex(input).collect(), expected);
     }
 
     #[test]
@@ -616,11 +361,7 @@ mod tests {
             SpannedToken::new(Token::RParen, (3, 31), (3, 31)),
             SpannedToken::new(Token::RParen, (3, 32), (3, 32)),
         ];
-        compare_tokens(
-            lex(input.clone()).collect(),
-            expected.clone(),
-        );
-        compare_tokens(iter_lex(input).collect(), expected);
+        compare_tokens(lex(input).collect(), expected);
     }
 
     #[test]
@@ -643,17 +384,13 @@ mod tests {
                     "string with \\\"escape\\\"".to_string(),
                 ),
                 (0, 21),
-                (0, 43),
+                (0, 44),
             ),
-            SpannedToken::new(Token::Quote, (0, 45), (0, 45)),
-            SpannedToken::new(Token::LParen, (0, 46), (0, 46)),
-            SpannedToken::new(Token::RParen, (0, 47), (0, 47)),
+            SpannedToken::new(Token::Quote, (0, 46), (0, 46)),
+            SpannedToken::new(Token::LParen, (0, 47), (0, 47)),
             SpannedToken::new(Token::RParen, (0, 48), (0, 48)),
+            SpannedToken::new(Token::RParen, (0, 49), (0, 49)),
         ];
-        compare_tokens(
-            lex(input.clone()).collect(),
-            expected.clone(),
-        );
-        compare_tokens(iter_lex(input).collect(), expected);
+        compare_tokens(lex(input).collect(), expected);
     }
 }
